@@ -25,8 +25,8 @@ class Synchronizer:
         self.aws_profile = aws_profile
         self.s3_endpoint_url = s3_endpoint_url
 
-        self.synced_files = self._get_already_sync()
         self._init_tracker()
+        self.synced_files = self._get_already_sync()
         self._s3_connect()
 
     def _init_tracker(self):
