@@ -11,19 +11,21 @@ from pathlib import Path
 import re
 import inotify.adapters
 import boto3
+import requests
 
 PICTURES_FOLDER_REGEX=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
 RESYNC_INTERVAL_COUNT=100
 
 class Synchronizer:
 
-    def __init__(self, base_folder, tracker_file, bucket_name, bucket_prefix, aws_profile, s3_endpoint_url):
+    def __init__(self, base_folder, tracker_file, bucket_name, bucket_prefix, aws_profile, s3_endpoint_url, server_refresh_url):
         self.base_folder = base_folder
         self.tracker_file = tracker_file
         self.bucket_name = bucket_name
         self.bucket_prefix = bucket_prefix
         self.aws_profile = aws_profile
         self.s3_endpoint_url = s3_endpoint_url
+        self.server_refresh_url = server_refresh_url
 
         self._init_tracker()
         self.synced_files = self._get_already_sync()
@@ -87,6 +89,15 @@ class Synchronizer:
         # Upload to S3
         self.s3.meta.client.upload_file(file_path, self.bucket_name, obj_name)
 
+    def _trigger_server_refresh(self):
+        """
+        Refresh server
+        """
+        try:
+            requests.post(self.server_refresh_url)
+        except Exception as err:
+            logging.error("Unable to refresh backend server : ", err)
+
     def sync(self, pics_folder):
         """
         Synchronize a local folder with S3
@@ -103,6 +114,8 @@ class Synchronizer:
                 logging.error("Unable to send picture " + str(src_path) + " to S3 : ", err)
             else:
                 successful_uploads.append(file)
+        # Trigger a refresh server side
+        self._trigger_server_refresh()
         # Update the synced file list
         self._update_tracker(successful_uploads)
 
@@ -134,6 +147,9 @@ class Synchronizer:
                     except Exception as err:
                         logging.error("Unable to send picture " + str(src_path) + " to S3 : ", err)
                     else:
+                        # Trigger a refresh server side if it's not a shot picture
+                        if 'shot' not in str(Path(filename)):
+                            self._trigger_server_refresh()
                         # Add the file to the synced list
                         self._update_tracker([filename])
                     # Update counter and folder tracker
@@ -190,6 +206,11 @@ def parse_args(argv):
         help="Endpoint URL for S3",
         default="https://s3.fr-par.scw.cloud"
     )
+    parser.add_argument(
+        '--server-refresh-url',
+        help="Endpoint URL for server refresh",
+        default="https://zalex.fr/refresh"
+    )
 
     return parser.parse_known_args()
 
@@ -220,7 +241,8 @@ def main(argv):
         parsed_args.bucket_name,
         parsed_args.bucket_prefix,
         parsed_args.aws_profile,
-        parsed_args.s3_endpoint_url
+        parsed_args.s3_endpoint_url,
+        parsed_args.server_refresh_url
     )
 
     if parsed_args.folder_resync is not None:

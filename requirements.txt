@@ -1,2 +1,3 @@
 boto3
 inotify
+requests==2.31.0
