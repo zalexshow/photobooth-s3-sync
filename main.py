@@ -176,6 +176,7 @@ def parse_args(argv):
         help="Base folder where photobooth is running",
         default="/home/photobooth/photobooth"
     )
+    #!!!!!! Do not use sync when you have files from another event on the same date !!!
     parser.add_argument(
         '--folder-resync', 
         help='Force resync of a folder (value must be folder full path)',
