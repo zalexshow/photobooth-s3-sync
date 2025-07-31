@@ -1,255 +1,263 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-from ast import parse
-import logging
-import argparse
-import sys
 import os
-from time import localtime, strftime
+import time
+import logging
+import hashlib
+import sqlite3
+import threading
+import argparse
 from pathlib import Path
+from datetime import datetime
 import re
-import inotify.adapters
+
 import boto3
+import inotify.adapters
 import requests
 
-PICTURES_FOLDER_REGEX=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
-RESYNC_INTERVAL_COUNT=100
+PICTURES_FOLDER_REGEX = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
 
-class Synchronizer:
-
-    def __init__(self, base_folder, tracker_file, bucket_name, bucket_prefix, aws_profile, s3_endpoint_url, server_refresh_url):
-        self.base_folder = base_folder
-        self.tracker_file = tracker_file
-        self.bucket_name = bucket_name
-        self.bucket_prefix = bucket_prefix
-        self.aws_profile = aws_profile
-        self.s3_endpoint_url = s3_endpoint_url
-        self.server_refresh_url = server_refresh_url
-
-        self._init_tracker()
-        self.synced_files = self._get_already_sync()
-        self._s3_connect()
-
-    def _init_tracker(self):
-        """
-        Initialize the tracker file if not exist
-        """
-        if not os.path.exists(self.tracker_file):
-            with open(self.tracker_file, "w") as fd:
-                fd.write("")
-
-    def _update_tracker(self, new_uploads):
-        """
-        Update the tracker file
-        """
-        self.synced_files += new_uploads
-        with open(self.tracker_file, "w") as fd:
-            fd.write("\n".join(self.synced_files))
-
-    def _s3_connect(self):
-        """
-        Initialize an S3 session
-        """
-        self.s3 = boto3.session.Session(
-            profile_name=self.aws_profile
-        ).resource(
-            's3',
-            endpoint_url=self.s3_endpoint_url
-        )
-
-    def _get_already_sync(self):
-        """
-        Get list of files already synced to S3
-        """
-        with open(self.tracker_file, "r") as fd:
-            files = fd.read().splitlines()
-        return files
-
-    def _get_new_files(self, pics_folder):
-        """
-        List all files that have not already been synced to S3 from a specific folder
-        """
-        # Get list of files locally
-        folder_files = sorted(os.listdir(pics_folder))
-        # Keep only ".jpg" files
-        filtered_files = [file for file in folder_files if Path(file).suffix == '.jpg']
-
-        # Diff between synced and local files
-        new_files = list(set(filtered_files) - set(self.synced_files))
-        return new_files
-
-    def _send_file(self, file_path):
-        """
-        Send a file to S3 bucket.
-        """
-        # Construct object path
-        obj_name = os.path.join(self.bucket_prefix, Path(file_path).name)
-        logging.info('Sending picture %s to bucket %s', obj_name, self.bucket_name)
-        # Upload to S3
-        self.s3.meta.client.upload_file(file_path, self.bucket_name, obj_name)
-
-    def _trigger_server_refresh(self):
-        """
-        Refresh server
-        """
-        try:
-            requests.post(self.server_refresh_url)
-        except Exception as err:
-            logging.error("Unable to refresh backend server : ", err)
-
-    def sync(self, pics_folder):
-        """
-        Synchronize a local folder with S3
-        """
-        new_files = self._get_new_files(pics_folder)
-        # Track successful uploads
-        successful_uploads = []
-        # Loop on files to upload
-        for file in new_files:
-            try:
-                src_path = os.path.join(pics_folder, file)
-                self._send_file(src_path)
-            except Exception as err:
-                logging.error("Unable to send picture " + str(src_path) + " to S3 : ", err)
-            else:
-                successful_uploads.append(file)
-        # Trigger a refresh server side
-        self._trigger_server_refresh()
-        # Update the synced file list
-        self._update_tracker(successful_uploads)
-
-    def run(self):
-        """
-        Start watching for new files on the local folder to sync
-        """
-        # Watch photobooth folder
-        watcher = inotify.adapters.InotifyTree(self.base_folder)
-
-        # Count files to trigger a full resync sometimes
-        file_counter = 0
-        processed_folders = []
-
-        # Loop on events        
-        for event in watcher.event_gen():
-            if event is not None:
-                (header, type_names, watch_path, filename) = event
-
-                # Only send file when closed, in folder matching the pattern and with jpg extension
-                if "IN_CLOSE_WRITE" in type_names and \
-                    bool(re.match(PICTURES_FOLDER_REGEX, Path(watch_path).name)) and \
-                    Path(filename).suffix == '.jpg':
-                    # Get full file path
-                    src_path = os.path.join(watch_path, filename)
-                    try:
-                        # Send
-                        self._send_file(src_path)
-                    except Exception as err:
-                        logging.error("Unable to send picture " + str(src_path) + " to S3 : ", err)
-                    else:
-                        # Trigger a refresh server side if it's not a shot picture
-                        if 'shot' not in str(Path(filename)):
-                            self._trigger_server_refresh()
-                        # Add the file to the synced list
-                        self._update_tracker([filename])
-                    # Update counter and folder tracker
-                    file_counter += 1
-                    if watch_path not in processed_folders:
-                        processed_folders.append(watch_path)
-
-                # After some file processings, trigger a resync
-                if file_counter >= RESYNC_INTERVAL_COUNT:
-                    file_counter = 0
-                    for folder in processed_folders:
-                        self.sync(folder)
-
-def parse_args(argv):
-
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='enable additional debug output'
-    )
-    parser.add_argument(
-        '--photobooth-folder',
-        help="Base folder where photobooth is running",
-        default="/home/photobooth/photobooth"
-    )
-    #!!!!!! Do not use sync when you have files from another event on the same date !!!
-    parser.add_argument(
-        '--folder-resync', 
-        help='Force resync of a folder (value must be folder full path)',
-        default=None
-    )
-    parser.add_argument(
-        '--tracker-file',
-        help="File used to track already synced pictures with S3",
-        default="synced-files.txt"
-    )
-    parser.add_argument(
-        '--bucket-name',
-        help="Name of S3 bucket to sync with",
-        default="photobooth"
-    )
-    parser.add_argument(
-        '--bucket-prefix',
-        help="Prefix for uploaded files inside bucket",
-        default="input/"
-    )
-    parser.add_argument(
-        '--aws-profile',
-        help="AWS profile to use for S3",
-        default="default"
-    )
-    parser.add_argument(
-        '--s3-endpoint-url',
-        help="Endpoint URL for S3",
-        default="https://s3.fr-par.scw.cloud"
-    )
-    parser.add_argument(
-        '--server-refresh-url',
-        help="Endpoint URL for server refresh",
-        default="https://zalex.fr/refresh"
-    )
-
-    return parser.parse_known_args()
-
-def main(argv):
-    # Parse command line arguments
-    parsed_args, unparsed_args = parse_args(argv)
-    argv = argv[:1] + unparsed_args
-
-    # Setup log level and format
-    if parsed_args.debug:
-        log_level = logging.DEBUG
-    else:
-        log_level = logging.INFO
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y/%m/%d %H:%M:%S',
-        level=log_level
-    )
-
-    # Check arguments
-    if parsed_args.photobooth_folder is None and parsed_args.folder_resync is None:
-        logging.error("At least one of --photobooth-folder or --folder-resync argument is required")
-        sys.exit(-1)
+class FileTracker:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
     
-    synchronizer = Synchronizer(
-        parsed_args.photobooth_folder,
-        parsed_args.tracker_file,
-        parsed_args.bucket_name,
-        parsed_args.bucket_prefix,
-        parsed_args.aws_profile,
-        parsed_args.s3_endpoint_url,
-        parsed_args.server_refresh_url
-    )
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS files (
+                    filepath TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    hash TEXT NOT NULL,
+                    uploaded_at TIMESTAMP
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_uploaded ON files(uploaded_at)")
+    
+    def _file_hash(self, filepath: str) -> str:
+        hash_md5 = hashlib.md5()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    
+    def track_file(self, filepath: str) -> bool:
+        """Track file if new or changed. Returns True if added/updated."""
+        try:
+            if not os.path.exists(filepath):
+                return False
+            
+            size = os.path.getsize(filepath)
+            file_hash = self._file_hash(filepath)
+            
+            with sqlite3.connect(self.db_path) as conn:
+                # Check if file exists and is unchanged
+                cursor = conn.execute(
+                    "SELECT size, hash FROM files WHERE filepath = ?", 
+                    (filepath,)
+                )
+                row = cursor.fetchone()
+                
+                if row and row[0] == size and row[1] == file_hash:
+                    return False  # File unchanged
+                
+                # Insert or update file
+                conn.execute("""
+                    INSERT OR REPLACE INTO files (filepath, size, hash, uploaded_at)
+                    VALUES (?, ?, ?, NULL)
+                """, (filepath, size, file_hash))
+                
+                logging.info(f"Tracked: {filepath}")
+                return True
+                
+        except Exception as e:
+            logging.error(f"Failed to track {filepath}: {e}")
+            return False
+    
+    def get_pending(self) -> list:
+        """Get all files not yet uploaded."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT filepath FROM files WHERE uploaded_at IS NULL ORDER BY filepath"
+            )
+            return [row[0] for row in cursor.fetchall()]
+    
+    def mark_uploaded(self, filepath: str):
+        """Mark file as successfully uploaded."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE files SET uploaded_at = ? WHERE filepath = ?",
+                (datetime.now(), filepath)
+            )
+    
+    def get_stats(self) -> dict:
+        """Get upload statistics."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(uploaded_at) as uploaded,
+                    COUNT(*) - COUNT(uploaded_at) as pending
+                FROM files
+            """)
+            row = cursor.fetchone()
+            return {
+                'total': row[0],
+                'uploaded': row[1], 
+                'pending': row[2]
+            }
 
-    if parsed_args.folder_resync is not None:
-        synchronizer.sync(parsed_args.folder_resync)
-    else:
-        synchronizer.run()
+class SimpleSync:
+    def __init__(self, watch_folder: str, db_path: str, s3_config: dict, refresh_url: str):
+        self.watch_folder = watch_folder
+        self.refresh_url = refresh_url
+        self.tracker = FileTracker(db_path)
+        self.running = False
+        
+        # S3 setup
+        self.s3_client = boto3.session.Session(
+            profile_name=s3_config['profile']
+        ).client('s3', endpoint_url=s3_config['endpoint'])
+        self.bucket = s3_config['bucket']
+        self.prefix = s3_config['prefix']
+    
+    def _upload_file(self, filepath: str) -> bool:
+        """Upload single file to S3. Returns True on success."""
+        try:
+            s3_key = os.path.join(self.prefix, Path(filepath).name)
+            logging.info(f"Uploading: {filepath} -> s3://{self.bucket}/{s3_key}")
+            
+            self.s3_client.upload_file(filepath, self.bucket, s3_key)
+            
+            # Trigger refresh
+            try:
+                requests.post(self.refresh_url, timeout=10)
+            except Exception as e:
+                logging.warning(f"Refresh failed: {e}")
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Upload failed {filepath}: {e}")
+            return False
+    
+    def _uploader_thread(self):
+        """Background thread that uploads pending files."""
+        while self.running:
+            try:
+                pending = self.tracker.get_pending()
+                
+                if not pending:
+                    time.sleep(2)
+                    continue
+                
+                for filepath in pending:
+                    if not self.running:
+                        break
+                    
+                    if not os.path.exists(filepath):
+                        logging.warning(f"File disappeared: {filepath}")
+                        continue
+                    
+                    if self._upload_file(filepath):
+                        self.tracker.mark_uploaded(filepath)
+                        logging.info(f"Uploaded: {filepath}")
+                    else:
+                        time.sleep(5)  # Wait before retry
+                        
+            except Exception as e:
+                logging.error(f"Uploader error: {e}")
+                time.sleep(10)
+    
+    def startup_scan(self):
+        """Scan existing files and track them."""
+        logging.info(f"Scanning: {self.watch_folder}")
+        
+        if not os.path.exists(self.watch_folder):
+            logging.error(f"Folder not found: {self.watch_folder}")
+            return
+        
+        count = 0
+        for item in os.listdir(self.watch_folder):
+            folder_path = os.path.join(self.watch_folder, item)
+            
+            if (os.path.isdir(folder_path) and 
+                re.match(PICTURES_FOLDER_REGEX, item)):
+                
+                for filename in os.listdir(folder_path):
+                    if filename.lower().endswith('.jpg'):
+                        filepath = os.path.join(folder_path, filename)
+                        if self.tracker.track_file(filepath):
+                            count += 1
+        
+        stats = self.tracker.get_stats()
+        logging.info(f"Scan complete: {count} new files, {stats['pending']} pending")
+    
+    def run(self):
+        """Main run loop."""
+        logging.info("Starting sync...")
+        
+        # Initial scan
+        self.startup_scan()
+        
+        # Start uploader thread
+        self.running = True
+        uploader = threading.Thread(target=self._uploader_thread, daemon=True)
+        uploader.start()
+        
+        # Watch for new files
+        try:
+            watcher = inotify.adapters.InotifyTree(self.watch_folder)
+            logging.info(f"Watching: {self.watch_folder}")
+            
+            for event in watcher.event_gen():
+                if not self.running:
+                    break
+                    
+                if event is None:
+                    continue
+                
+                (_, type_names, watch_path, filename) = event
+                
+                if ("IN_CLOSE_WRITE" in type_names and 
+                    filename.lower().endswith('.jpg') and
+                    re.match(PICTURES_FOLDER_REGEX, Path(watch_path).name)):
+                    
+                    filepath = os.path.join(watch_path, filename)
+                    self.tracker.track_file(filepath)
+                    
+        except KeyboardInterrupt:
+            logging.info("Stopping...")
+        finally:
+            self.running = False
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--folder', required=True, help='Folder to watch')
+    parser.add_argument('--db', default='sync.db', help='SQLite database')
+    parser.add_argument('--bucket', required=True, help='S3 bucket name') 
+    parser.add_argument('--prefix', default='input/', help='S3 key prefix')
+    parser.add_argument('--profile', default='default', help='AWS profile')
+    parser.add_argument('--endpoint', required=True, help='S3 endpoint URL')
+    parser.add_argument('--refresh-url', required=True, help='Refresh URL')
+    parser.add_argument('--debug', action='store_true', help='Debug logging')
+    
+    args = parser.parse_args()
+    
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    s3_config = {
+        'bucket': args.bucket,
+        'prefix': args.prefix, 
+        'profile': args.profile,
+        'endpoint': args.endpoint
+    }
+    
+    sync = SimpleSync(args.folder, args.db, s3_config, args.refresh_url)
+    sync.run()
 
 if __name__ == '__main__':
-    main(sys.argv)
+    main()
