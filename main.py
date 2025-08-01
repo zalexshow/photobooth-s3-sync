@@ -29,10 +29,17 @@ class FileTracker:
                     filepath TEXT PRIMARY KEY,
                     size INTEGER NOT NULL,
                     hash TEXT NOT NULL,
-                    uploaded_at TIMESTAMP
+                    uploaded_at TIMESTAMP,
+                    mtime REAL
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_uploaded ON files(uploaded_at)")
+            
+            # Add mtime column if it doesn't exist (migration)
+            try:
+                conn.execute("ALTER TABLE files ADD COLUMN mtime REAL")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
     
     def _file_hash(self, filepath: str) -> str:
         hash_md5 = hashlib.md5()
@@ -47,25 +54,38 @@ class FileTracker:
             if not os.path.exists(filepath):
                 return False
             
-            size = os.path.getsize(filepath)
-            file_hash = self._file_hash(filepath)
+            stat = os.stat(filepath)
+            size, mtime = stat.st_size, stat.st_mtime
             
             with sqlite3.connect(self.db_path) as conn:
-                # Check if file exists and is unchanged
+                # Check if file exists and is unchanged (size + mtime check first)
                 cursor = conn.execute(
-                    "SELECT size, hash FROM files WHERE filepath = ?", 
+                    "SELECT size, hash, mtime FROM files WHERE filepath = ?", 
                     (filepath,)
                 )
                 row = cursor.fetchone()
                 
+                # Quick check: if size and mtime match, assume unchanged
+                if row and row[0] == size and row[2] == mtime:
+                    return False  # File unchanged, skip hash calculation
+                
+                # If size/mtime different, calculate hash
+                file_hash = self._file_hash(filepath)
+                
+                # Double check with hash if we have existing data
                 if row and row[0] == size and row[1] == file_hash:
-                    return False  # File unchanged
+                    # Same content but mtime changed, just update mtime
+                    conn.execute(
+                        "UPDATE files SET mtime = ? WHERE filepath = ?",
+                        (mtime, filepath)
+                    )
+                    return False
                 
                 # Insert or update file
                 conn.execute("""
-                    INSERT OR REPLACE INTO files (filepath, size, hash, uploaded_at)
-                    VALUES (?, ?, ?, NULL)
-                """, (filepath, size, file_hash))
+                    INSERT OR REPLACE INTO files (filepath, size, hash, uploaded_at, mtime)
+                    VALUES (?, ?, ?, NULL, ?)
+                """, (filepath, size, file_hash, mtime))
                 
                 logging.info(f"Tracked: {filepath}")
                 return True
@@ -88,6 +108,15 @@ class FileTracker:
             conn.execute(
                 "UPDATE files SET uploaded_at = ? WHERE filepath = ?",
                 (datetime.now(), filepath)
+            )
+    
+    def mark_all_uploaded(self, filepaths: list):
+        """Mark multiple files as uploaded in batch."""
+        current_time = datetime.now()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(
+                "UPDATE files SET uploaded_at = ? WHERE filepath = ?",
+                [(current_time, fp) for fp in filepaths]
             )
     
     def get_stats(self) -> dict:
@@ -177,7 +206,8 @@ class SimpleSync:
             logging.error(f"Folder not found: {self.watch_folder}")
             return
         
-        count = 0
+        # Collect all files first
+        all_files = []
         for item in os.listdir(self.watch_folder):
             folder_path = os.path.join(self.watch_folder, item)
             
@@ -187,8 +217,19 @@ class SimpleSync:
                 for filename in os.listdir(folder_path):
                     if filename.lower().endswith('.jpg'):
                         filepath = os.path.join(folder_path, filename)
-                        if self.tracker.track_file(filepath):
-                            count += 1
+                        all_files.append(filepath)
+        
+        logging.info(f"Found {len(all_files)} files to scan")
+        
+        # Process files with progress logging
+        count = 0
+        for i, filepath in enumerate(all_files):
+            if self.tracker.track_file(filepath):
+                count += 1
+            
+            # Progress logging every 1000 files
+            if (i + 1) % 1000 == 0:
+                logging.info(f"Progress: {i + 1}/{len(all_files)} files scanned, {count} new")
         
         stats = self.tracker.get_stats()
         logging.info(f"Scan complete: {count} new files, {stats['pending']} pending")
